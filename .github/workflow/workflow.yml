@@ -1,81 +1,143 @@
-name: Deploy Website
+name: Full DevOps Pipeline (Docker + Terraform + EKS)
 
 on:
-  push:
-    branches:
-      - main
-      - develop
-  pull_request:
-    branches:
-      - main
+push:
+branches:
+- main
 
-env:
-  DEPLOY_ENVIRONMENT: production
+IMAGE_NAME: hemavathiks/my-frontend-app
+CLUSTER_NAME: chandru-eks
+REGION: ${{ secrets.AWS_REGION }}
+NAMESPACE: myapp
+DEPLOYMENT_NAME: myapp
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
 
-      - name: Validate HTML
-        run: |
-          echo "Validating HTML files..."
-          find . -name "*.html" -type f
-          echo "HTML validation passed"
+# ==========================================
 
-      - name: Check for broken links
-        run: |
-          echo "Checking for broken links in HTML..."
-          grep -r "href=" *.html || echo "No href attributes found"
+# STAGE 1 – BUILD & PUSH DOCKER IMAGE
 
-      - name: Verify assets
-        run: |
-          echo "Verifying CSS, JavaScript, and image assets..."
-          echo "All assets verified"
+# ==========================================
 
-  test:
-    runs-on: ubuntu-latest
-    needs: build
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+build:
+runs-on: ubuntu-latest
 
-      - name: Run accessibility tests
-        run: |
-          echo "Running accessibility checks..."
-          echo "Accessibility tests completed"
+```
+steps:
+  - name: Checkout code
+    uses: actions/checkout@v4
 
-      - name: Performance testing
-        run: |
-          echo "Running performance tests..."
-          echo "Performance metrics collected"
+  - name: Set up Docker Buildx
+    uses: docker/setup-buildx-action@v3
 
-  deploy:
-    runs-on: ubuntu-latest
-    needs: test
-    if: github.ref == 'refs/heads/main'
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+  - name: Docker login
+    uses: docker/login-action@v3
+    with:
+      username: ${{ secrets.DOCKERHUB_USERNAME }}
+      password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Deploy to staging
-        run: |
-          echo "Deploying to staging environment..."
-          echo "Staging deployment complete"
+  - name: Build and push Docker image
+    uses: docker/build-push-action@v5
+    with:
+      context: .
+      push: true
+      tags: |
+        ${{ env.IMAGE_NAME }}:latest
+        ${{ env.IMAGE_NAME }}:${{ github.sha }}
+```
 
-      - name: Health check
-        run: |
-          echo "Running health checks..."
-          echo "Health checks passed"
+# ==========================================
 
-      - name: Deploy to production
-        run: |
-          echo "Deploying to production environment..."
-          echo "Production deployment complete"
+# STAGE 2 – TERRAFORM (CREATE EKS IF NEEDED)
 
-      - name: Notification
-        if: always()
-        run: |
-          echo "Deployment notification sent"
+# ==========================================
+
+terraform:
+runs-on: ubuntu-latest
+needs: build
+
+```
+defaults:
+  run:
+    working-directory: eks-terraform
+
+steps:
+  - name: Checkout code
+    uses: actions/checkout@v4
+
+  - name: AWS Login
+    uses: aws-actions/configure-aws-credentials@v4
+    with:
+      aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      aws-region: ${{ secrets.AWS_REGION }}
+
+  - name: Setup Terraform
+    uses: hashicorp/setup-terraform@v3
+
+  - name: Terraform Init
+    run: terraform init
+
+  - name: Terraform Validate
+    run: terraform validate
+
+  - name: Terraform Plan
+    run: terraform plan
+
+  - name: Terraform Apply
+    run: terraform apply -auto-approve
+```
+
+# ==========================================
+
+# STAGE 3 – DEPLOY TO EKS
+
+# ==========================================
+
+deploy:
+runs-on: ubuntu-latest
+needs: terraform
+
+```
+steps:
+  - name: Checkout code
+    uses: actions/checkout@v4
+
+  - name: AWS Login
+    uses: aws-actions/configure-aws-credentials@v4
+    with:
+      aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      aws-region: ${{ secrets.AWS_REGION }}
+
+  - name: Install kubectl
+    run: |
+      curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+      chmod +x kubectl
+      sudo mv kubectl /usr/local/bin/
+
+  - name: Connect to EKS
+    run: |
+      aws eks update-kubeconfig --name $CLUSTER_NAME --region $REGION
+      kubectl get nodes
+
+  - name: Create namespace
+    run: kubectl apply -f k8s/namespace.yaml
+
+  - name: Deploy application
+    run: |
+      kubectl apply -f k8s/deployment.yaml -n $NAMESPACE
+      kubectl apply -f k8s/service.yaml -n $NAMESPACE
+
+  - name: Update image
+    run: |
+      kubectl set image deployment/$DEPLOYMENT_NAME \
+      $DEPLOYMENT_NAME=$IMAGE_NAME:${{ github.sha }} \
+      -n $NAMESPACE
+
+  - name: Deploy ingress
+    run: kubectl apply -f k8s/ingress.yaml -n $NAMESPACE
+
+  - name: Show service
+    run: kubectl get svc -n $NAMESPACE
+```
